@@ -24,6 +24,8 @@
 using System;
 using System.Text;
 using System.Net.Sockets;
+using System.Threading.Tasks;
+using System.Linq;
 using Server;
 using Server.Misc;
 using Server.Network;
@@ -33,6 +35,7 @@ namespace Server.RemoteAdmin
 {
 	public static class CustomRemoteAdminPacketHandlers
 	{
+		// private static UdpClient Listener;
 		public static void Configure()
 		{
 			RemoteAdminHandlers.Register(0x41, new OnPacketReceive(Save));
@@ -43,6 +46,62 @@ namespace Server.RemoteAdmin
 
 			Channel.AddStaticChannel("Discord");
 			ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayToDiscord));
+
+			UDPListener();
+		}
+
+		private static void UDPListener()
+		{
+			Task.Run(async () =>
+			{
+				using (var udpClient = new UdpClient(27030))
+				{
+					Utility.PushColor(ConsoleColor.Green);
+					Console.WriteLine("RCON Listening: *.*.*.*:27030");
+					Utility.PopColor();
+					
+					while(true)
+					{
+						var receivedResults = await udpClient.ReceiveAsync();
+						
+						ProcessPacket(receivedResults, udpClient);
+					}
+				}
+			});
+		}
+
+		private static void ProcessPacket(UdpReceiveResult data, UdpClient client)
+		{
+			byte[] default_header = { 255, 255, 255, 255 };
+
+			byte[] b = data.Buffer;
+			string endByte = Encoding.ASCII.GetString(b).Substring(b.Length - 1, 1);
+			byte[] header = b.Take(4).ToArray();
+			
+			if(!header.SequenceEqual(default_header))
+			{
+				Utility.PushColor(ConsoleColor.Red);
+				Console.WriteLine("RCON: Received invalid header in packet.");
+				Utility.PopColor();
+				client.Send(new byte[] { 255 }, 1, data.RemoteEndPoint);
+				return;
+			}
+
+			if(endByte != "\n")
+			{
+				Utility.PushColor(ConsoleColor.Red);
+				Console.WriteLine("RCON: Received invalid closing byte in packet.");
+				Utility.PopColor();
+				client.Send(new byte[] { 255 }, 1, data.RemoteEndPoint);
+				return;
+			}
+
+			byte[] x = b.Take(b.Length - 1).Skip(4).ToArray();
+
+			string content = Encoding.ASCII.GetString(x);
+			Console.WriteLine("RCON: {0} command received.", Encoding.ASCII.GetString(x));
+
+			client.Send(data.Buffer, data.Buffer.Length, data.RemoteEndPoint);
 		}
 
 		private static void RelayToDiscord(ChatUser from, Channel channel, string param)

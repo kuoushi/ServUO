@@ -95,6 +95,7 @@ namespace Server.RemoteAdmin
 		public int ListenPort => Int32.Parse(m_Vars["ListenPort"]);
 		public string ChatPacketTargetAddress => m_Vars["ChatPacketTargetAddress"];
 		public int ChatPacketTargetPort => Int32.Parse(m_Vars["ChatPacketTargetPort"]);
+		public string ChatChannel => m_Vars["ChatChannel"];
 
 		private Dictionary<string, string> m_Vars;
 
@@ -132,7 +133,7 @@ namespace Server.RemoteAdmin
 
 		public bool RelayEnabled()
 		{
-			if (m_Vars.ContainsKey("ChatPacketTargetAddress") && m_Vars.ContainsKey("ChatPacketTargetPort"))
+			if (m_Vars.ContainsKey("ChatPacketTargetAddress") && m_Vars.ContainsKey("ChatPacketTargetPort") && m_Vars.ContainsKey("ChatChannel"))
 				return true;
 			return false;
 		}
@@ -158,8 +159,11 @@ namespace Server.RemoteAdmin
 			rconConfig = new RconConfig("RconConfig.cfg");
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
 
-			Channel.AddStaticChannel("Discord");
-			ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayToDiscord));
+			if (rconConfig.RelayEnabled())
+			{
+				Channel.AddStaticChannel(rconConfig.ChatChannel);
+				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayToDiscord));
+			}
 
 			UDPListener();
 		}
@@ -265,7 +269,7 @@ namespace Server.RemoteAdmin
 		private static void RelayToDiscord(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
-			if(rconConfig.RelayEnabled())
+			if(channel.Name == rconConfig.ChatChannel)
 			{
 				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + from.Username + "\t" + param);
 				using (UdpClient c = new UdpClient(3896))

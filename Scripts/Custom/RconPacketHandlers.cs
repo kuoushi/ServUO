@@ -23,6 +23,8 @@
 
 using System;
 using System.Text;
+using System.Net;
+using System.IO;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 using System.Collections.Generic;
@@ -30,7 +32,6 @@ using System.Linq;
 using Server.Misc;
 using Server.Network;
 using Server.Engines.Chat;
-using System.Net;
 
 namespace Server.RemoteAdmin
 {
@@ -88,6 +89,55 @@ namespace Server.RemoteAdmin
 		}
 	}
 
+	public class RconConfig
+	{
+		public string RconPassword => m_Vars["RconPassword"];
+		public int ListenPort => Int32.Parse(m_Vars["ListenPort"]);
+		public string ChatPacketTargetAddress => m_Vars["ChatPacketTargetAddress"];
+		public int ChatPacketTargetPort => Int32.Parse(m_Vars["ChatPacketTargetPort"]);
+
+		private Dictionary<string, string> m_Vars;
+
+		public RconConfig(string filename)
+		{
+			m_Vars = new Dictionary<string, string>();
+			var path = Path.Combine("Scripts/Custom", filename);
+			// var path = Directory.GetCurrentDirectory() + "\\Scripts\\Custom\\" + filename;
+			FileInfo cfg = new FileInfo(path);
+			if(cfg.Exists)
+			{
+				using (StreamReader stream = new StreamReader(cfg.FullName))
+				{
+					String line;
+					while ((line = stream.ReadLine()) != null)
+					{
+						if (!line.StartsWith("#"))
+						{
+							var parts = line.Split('=');
+							if(parts.Length == 2)
+							{
+								var key = parts[0];
+								var value = parts[1];
+								m_Vars.Add(key, value);
+							}
+						}
+					}
+				}
+			}
+			else
+			{
+				throw new Exception("RconConfig.cfg file is missing.");
+			}
+		}
+
+		public bool RelayEnabled()
+		{
+			if (m_Vars.ContainsKey("ChatPacketTargetAddress") && m_Vars.ContainsKey("ChatPacketTargetPort"))
+				return true;
+			return false;
+		}
+	}
+
 	public static class RconPacketHandlers
 	{
 		private readonly static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_Funcs = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>() {
@@ -101,13 +151,11 @@ namespace Server.RemoteAdmin
 		};
 
 		private static Dictionary<string, RconChallengeRecord> m_Challenges;
-		private static string RconPassword;
-		private static int ListenPort;
+		private static RconConfig rconConfig;
 
 		public static void Configure()
 		{
-			RconPassword = "tempnoguessplz";
-			ListenPort = 27030;
+			rconConfig = new RconConfig("RconConfig.cfg");
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
 
 			Channel.AddStaticChannel("Discord");
@@ -120,10 +168,10 @@ namespace Server.RemoteAdmin
 		{
 			Task.Run(async () =>
 			{
-				using (var udpClient = new UdpClient(ListenPort))
+				using (var udpClient = new UdpClient(rconConfig.ListenPort))
 				{
 					Utility.PushColor(ConsoleColor.Green);
-					Console.WriteLine("RCON: Listening on *.*.*.*:{0}", ListenPort);
+					Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
 					Utility.PopColor();
 					
 					while(true)
@@ -144,8 +192,6 @@ namespace Server.RemoteAdmin
 				client.Send(new byte[] { 0xFF }, 1, data.RemoteEndPoint);
 				return;
 			}
-
-			Console.WriteLine("RCON: {0} command received.", packetReader.CommandString);
 
 			byte[] response;
 			try
@@ -203,7 +249,7 @@ namespace Server.RemoteAdmin
 			{
 				var password = pvSrc.ReadString();
 
-				if (password == RconPassword)
+				if (password == rconConfig.RconPassword)
 				{
 					return true;
 				}
@@ -219,9 +265,12 @@ namespace Server.RemoteAdmin
 		private static void RelayToDiscord(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
-			byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + from.Username + "\t" + param);
-			using (UdpClient c = new UdpClient(3896))
-				c.Send(data, data.Length, "10.0.0.5", 3896);
+			if(rconConfig.RelayEnabled())
+			{
+				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + from.Username + "\t" + param);
+				using (UdpClient c = new UdpClient(3896))
+					c.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+			}
 		}
 
 		private static byte[] GetChallenge(IPEndPoint remote, PacketReader pvSrc)
@@ -271,16 +320,14 @@ namespace Server.RemoteAdmin
 				return new byte[] { 0xFF };
 			}
 
-			string channel_name = pvSrc.ReadUTF8String();
+			Channel channel = Channel.FindChannelByName(pvSrc.ReadUTF8String());
 			string message = pvSrc.ReadUTF8String();
 			int hue = pvSrc.ReadInt32();
 			// bool ascii_text = pvSrc.ReadBoolean();
-			Channel channel = Channel.FindChannelByName(channel_name);
-
+			
 			foreach (ChatUser user in channel.Users)
 			{
-				Mobile player = user.Mobile;
-				player.SendMessage(hue, message);
+				user.Mobile.SendMessage(hue, message);
 			}
 
 			return new byte[] { 0x0A };
@@ -328,8 +375,6 @@ namespace Server.RemoteAdmin
 
 			bool save = pvSrc.ReadBoolean();
 			bool restart = pvSrc.ReadBoolean();
-			Console.WriteLine("Save: {0}, Restart: {1}", save, restart);
-
 			Console.WriteLine("RCON: shutting down server (Restart: {0}) (Save: {1}) [{2}]", restart, save, DateTime.Now);
 
 			if (save && !AutoRestart.Restarting)

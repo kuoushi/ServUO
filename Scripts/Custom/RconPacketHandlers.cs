@@ -324,14 +324,25 @@ namespace Server.RemoteAdmin
 				return new byte[] { 0xFF };
 			}
 
-			Channel channel = Channel.FindChannelByName(pvSrc.ReadUTF8String());
+			string channel_name = pvSrc.ReadUTF8String();
 			string message = pvSrc.ReadUTF8String();
 			int hue = pvSrc.ReadInt32();
 			// bool ascii_text = pvSrc.ReadBoolean();
-			
-			foreach (ChatUser user in channel.Users)
+			Channel channel = Channel.FindChannelByName(channel_name);
+
+			if(channel != null)
 			{
-				user.Mobile.SendMessage(hue, message);
+				foreach (ChatUser user in channel.Users)
+				{
+					user.Mobile.SendMessage(hue, message);
+				}
+			}
+			else
+			{
+				Utility.PushColor(ConsoleColor.Red);
+				Console.WriteLine("RCON: {0} channel not found.", channel_name);
+				Utility.PopColor();
+				return new byte[] { 0xFF };
 			}
 
 			return new byte[] { 0x0A };

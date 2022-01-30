@@ -52,9 +52,9 @@ namespace Server.RemoteAdmin
 		public RconPacketReader(byte[] data, int size) : base(data, size, true)
 		{
 			if(data.Length < 6) { m_Valid = false; return; }
-			Seek(1, System.IO.SeekOrigin.End);
+			Seek(1, SeekOrigin.End);
 			var end = ReadByte();
-			Seek(0, System.IO.SeekOrigin.Begin);
+			Seek(0, SeekOrigin.Begin);
 			var head = ReadInt32();
 			m_CommandByte = ReadByte();
 			if (head != -1 || end != 0x0A || !m_Commands.ContainsKey(m_CommandByte)) { m_Valid = false; }
@@ -103,7 +103,6 @@ namespace Server.RemoteAdmin
 		{
 			m_Vars = new Dictionary<string, string>();
 			var path = Path.Combine("Scripts/Custom", filename);
-			// var path = Directory.GetCurrentDirectory() + "\\Scripts\\Custom\\" + filename;
 			FileInfo cfg = new FileInfo(path);
 			if(cfg.Exists)
 			{
@@ -139,30 +138,46 @@ namespace Server.RemoteAdmin
 		}
 	}
 
+	public static class RconResponsePackets
+	{
+		public static byte[] Success = new byte[] { 0x0A };
+		public static byte[] Fail = new byte[] { 0xFF };
+		public static byte[] InvalidChallenge = new byte[] { 0xF0 };
+		public static byte[] InvalidPassword = new byte[] { 0xF1 };
+	}
+
 	public static class RconPacketHandlers
 	{
 		private readonly static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_Funcs = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>() {
-			{ 0x1A, GetChallenge },
 			{ 0x1B, Status },
 			{ 0x1C, WorldBroadcast },
-			{ 0x1D, ChannelSend },
-			{ 0x1E, Save },
-			{ 0x1F, Shutdown },
+			{ 0x1D, ChannelSend }
+		};
+
+		private readonly static Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>> m_FuncsNoVerify = new Dictionary<byte, Func<IPEndPoint, PacketReader, byte[]>>() {
+			{ 0x1A, GetChallenge },
 			{ 0x20, KeepAlive }
+		};
+
+		private readonly static Dictionary<byte, Action<IPEndPoint, PacketReader>> m_Actions = new Dictionary<byte, Action<IPEndPoint, PacketReader>>() {
+			{ 0x1E, Save },
+			{ 0x1F, Shutdown }
 		};
 
 		private static Dictionary<string, RconChallengeRecord> m_Challenges;
 		private static RconConfig rconConfig;
+		private static UdpClient udpListener;
 
 		public static void Configure()
 		{
 			rconConfig = new RconConfig("RconConfig.cfg");
 			m_Challenges = new Dictionary<string, RconChallengeRecord>();
+			udpListener = new UdpClient(rconConfig.ListenPort);
 
 			if (rconConfig.RelayEnabled())
 			{
 				Channel.AddStaticChannel(rconConfig.ChatChannel);
-				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayToDiscord));
+				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
 			}
 
 			UDPListener();
@@ -172,18 +187,15 @@ namespace Server.RemoteAdmin
 		{
 			Task.Run(async () =>
 			{
-				using (var udpClient = new UdpClient(rconConfig.ListenPort))
-				{
-					Utility.PushColor(ConsoleColor.Green);
-					Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
-					Utility.PopColor();
+				Utility.PushColor(ConsoleColor.Green);
+				Console.WriteLine("RCON: Listening on *.*.*.*:{0}", rconConfig.ListenPort);
+				Utility.PopColor();
 					
-					while(true)
-					{
-						var receivedResults = await udpClient.ReceiveAsync();
+				while(true)
+				{
+					var receivedResults = await udpListener.ReceiveAsync();
 						
-						ProcessPacket(receivedResults, udpClient);
-					}
+					ProcessPacket(receivedResults, udpListener);
 				}
 			});
 		}
@@ -193,30 +205,47 @@ namespace Server.RemoteAdmin
 			var packetReader = new RconPacketReader(data.Buffer, data.Buffer.Length);
 			if(!packetReader.IsValid)
 			{
-				client.Send(new byte[] { 0xFF }, 1, data.RemoteEndPoint);
+				client.Send(RconResponsePackets.Fail, 1, data.RemoteEndPoint);
 				return;
 			}
 
 			byte[] response;
+
+			if (m_FuncsNoVerify.ContainsKey(packetReader.Command))
+			{
+				response = m_FuncsNoVerify[packetReader.Command](data.RemoteEndPoint, packetReader);
+				client.Send(response, response.Length, data.RemoteEndPoint);
+				return;
+			}
+
 			try
 			{
-				response = m_Funcs[packetReader.Command](data.RemoteEndPoint, packetReader);
+				response = Verify(data.RemoteEndPoint, ref packetReader);
 			}
 			catch (Exception ex)
 			{
 				Console.WriteLine(ex.Message);
-				client.Send(new byte[] { 0xFF }, 1, data.RemoteEndPoint);
+				client.Send(RconResponsePackets.Fail, 1, data.RemoteEndPoint);
 				return;
 			}
+
 			try
 			{
-				if (response != null)
+				if (response != null && response.SequenceEqual(RconResponsePackets.Success))
 				{
-					client.Send(response, response.Length, data.RemoteEndPoint);
+					if (m_Funcs.ContainsKey(packetReader.Command)) {
+						response = m_Funcs[packetReader.Command](data.RemoteEndPoint, packetReader);
+						client.Send(response, response.Length, data.RemoteEndPoint);
+					}
+					else if (m_Actions.ContainsKey(packetReader.Command))
+					{
+						client.Send(response, response.Length, data.RemoteEndPoint);
+						m_Actions[packetReader.Command](data.RemoteEndPoint, packetReader);
+					}
 				}
 				else
 				{
-					client.Send(new byte[] { 0xFF }, 1, data.RemoteEndPoint);
+					client.Send(response, response.Length, data.RemoteEndPoint);
 				}
 			}
 			catch(Exception ex)
@@ -225,7 +254,7 @@ namespace Server.RemoteAdmin
 			}
 		}
 
-		private static bool IsChallengeValid(IPEndPoint remote, ref PacketReader pvSrc)
+		private static bool IsChallengeValid(IPEndPoint remote, ref RconPacketReader pvSrc)
 		{
 			try
 			{
@@ -247,7 +276,7 @@ namespace Server.RemoteAdmin
 			return false;
 		}
 
-		private static bool IsPasswordValid(ref PacketReader pvSrc)
+		private static bool IsPasswordValid(ref RconPacketReader pvSrc)
 		{
 			try
 			{
@@ -266,14 +295,28 @@ namespace Server.RemoteAdmin
 			return false;
 		}
 
-		private static void RelayToDiscord(ChatUser from, Channel channel, string param)
+		private static byte[] Verify(IPEndPoint remote, ref RconPacketReader pvSrc)
+		{
+			if (!IsChallengeValid(remote, ref pvSrc))
+			{
+				return RconResponsePackets.InvalidChallenge;
+			}
+
+			if (!IsPasswordValid(ref pvSrc))
+			{
+				return RconResponsePackets.InvalidPassword;
+			}
+
+			return RconResponsePackets.Success;
+		}
+
+		private static void RelayChatPacket(ChatUser from, Channel channel, string param)
 		{
 			ChatActionHandlers.ChannelMessage(from, channel, param);
-			if(channel.Name == rconConfig.ChatChannel)
+			if(channel.Name == rconConfig.ChatChannel || rconConfig.ChatChannel == "*")
 			{
-				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + from.Username + "\t" + param);
-				using (UdpClient c = new UdpClient(3896))
-					c.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
+				byte[] data = Encoding.ASCII.GetBytes("UO\tm\t" + channel.Name + "\t" + from.Username + "\t" + param);
+				udpListener.Send(data, data.Length, rconConfig.ChatPacketTargetAddress, rconConfig.ChatPacketTargetPort);
 			}
 		}
 
@@ -296,34 +339,26 @@ namespace Server.RemoteAdmin
 			}
 
 			byte[] header = BitConverter.GetBytes((int)-1).Reverse().ToArray();
-			byte[] challenge = header.Append((byte)0x0A).Append((byte)0x20).Concat((byte[])challengeBytes).Append((byte)0x20).Append((byte)0x32).Append((byte)0x0A).ToArray();
 
+			byte[] challenge = { 0xFF, 0xFF, 0xFF, 0xFF, 0x0A, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x32, 0x0A };
+			challengeBytes.CopyTo(challenge, 6);
+			
 			return challenge;
 		}
 
 		private static byte[] WorldBroadcast(IPEndPoint remote, PacketReader pvSrc)
 		{
-			if (!(IsChallengeValid(remote, ref pvSrc) && IsPasswordValid(ref pvSrc)))
-			{
-				return new byte[] { 0xFF };
-			}
-
 			string message = pvSrc.ReadUTF8String();
 			int hue = pvSrc.ReadInt32();
 			// bool ascii = pvSrc.ReadBoolean();
 
 			World.Broadcast(hue, false, message);
 
-			return new byte[] { 0x0A };
+			return RconResponsePackets.Success;
 		}
 
 		private static byte[] ChannelSend(IPEndPoint remote, PacketReader pvSrc)
 		{
-			if(!(IsChallengeValid(remote, ref pvSrc) && IsPasswordValid(ref pvSrc)))
-			{
-				return new byte[] { 0xFF };
-			}
-
 			string channel_name = pvSrc.ReadUTF8String();
 			string message = pvSrc.ReadUTF8String();
 			int hue = pvSrc.ReadInt32();
@@ -342,10 +377,10 @@ namespace Server.RemoteAdmin
 				Utility.PushColor(ConsoleColor.Red);
 				Console.WriteLine("RCON: {0} channel not found.", channel_name);
 				Utility.PopColor();
-				return new byte[] { 0xFF };
+				return RconResponsePackets.Fail;
 			}
 
-			return new byte[] { 0x0A };
+			return RconResponsePackets.Success;
 		}
 
 		private static byte[] KeepAlive(IPEndPoint remote, PacketReader pvSrc)
@@ -356,38 +391,19 @@ namespace Server.RemoteAdmin
 			}
 			else
 			{
-				return new byte[] { 0xFF };
+				return RconResponsePackets.Fail;
 			}
 
-			return new byte[] { 0x0A };
+			return RconResponsePackets.Success;
 		}
 
-		private static byte[] Save(IPEndPoint remote, PacketReader pvSrc)
+		private static void Save(IPEndPoint remote, PacketReader pvSrc)
 		{
-			if (!(IsChallengeValid(remote, ref pvSrc) && IsPasswordValid(ref pvSrc)))
-			{
-				return new byte[] { 0xFF };
-			}
-
-			try
-			{
-				// AutoSave.Save();
-			}
-			catch(Exception ex)
-			{
-				Console.WriteLine(ex.Message);
-			}
-
-			return new byte[] { 0x0A };
+			AutoSave.Save();
 		}
 
-		private static byte[] Shutdown(IPEndPoint remote, PacketReader pvSrc)
+		private static void Shutdown(IPEndPoint remote, PacketReader pvSrc)
 		{
-			if (!(IsChallengeValid(remote, ref pvSrc) && IsPasswordValid(ref pvSrc)))
-			{
-				return new byte[] { 0xFF };
-			}
-
 			bool save = pvSrc.ReadBoolean();
 			bool restart = pvSrc.ReadBoolean();
 			Console.WriteLine("RCON: shutting down server (Restart: {0}) (Save: {1}) [{2}]", restart, save, DateTime.Now);
@@ -396,18 +412,11 @@ namespace Server.RemoteAdmin
 				AutoSave.Save();
 
 			Core.Kill(restart);
-
-			return new byte[] { 0x0A };
 		}
 
 		private static byte[] Status(IPEndPoint remote, PacketReader pvSrc)
 		{
-			if (!(IsChallengeValid(remote, ref pvSrc) && IsPasswordValid(ref pvSrc)))
-			{
-				return new byte[] { 0xFF };
-			}
-
-			return new byte[] { 0x0A };
+			return RconResponsePackets.Success;
 		}
 	}
 }

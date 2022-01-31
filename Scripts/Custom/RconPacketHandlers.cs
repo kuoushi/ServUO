@@ -263,7 +263,7 @@ namespace Server.RemoteAdmin
 				{
 					challenge[i] = pvSrc.ReadByte();
 				}
-				if (m_Challenges.ContainsKey(remote.Address.ToString()) && m_Challenges[remote.Address.ToString()].Challenge.SequenceEqual(challenge))
+				if (m_Challenges.ContainsKey(remote.Address.ToString()) && m_Challenges[remote.Address.ToString()].Challenge.SequenceEqual(challenge) && m_Challenges[remote.Address.ToString()].LastChallenge > DateTime.Now.AddMinutes(-30))
 				{
 					return true;
 				}
@@ -307,6 +307,7 @@ namespace Server.RemoteAdmin
 				return RconResponsePackets.InvalidPassword;
 			}
 
+			m_Challenges[remote.Address.ToString()].Refresh();
 			return RconResponsePackets.Success;
 		}
 

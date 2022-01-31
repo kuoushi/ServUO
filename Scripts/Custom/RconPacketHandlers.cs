@@ -176,7 +176,10 @@ namespace Server.RemoteAdmin
 
 			if (rconConfig.RelayEnabled())
 			{
-				Channel.AddStaticChannel(rconConfig.ChatChannel);
+				if(rconConfig.ChatChannel != "*")
+				{
+					Channel.AddStaticChannel(rconConfig.ChatChannel);
+				}
 				ChatActionHandlers.Register(0x61, true, new OnChatAction(RelayChatPacket));
 			}
 
